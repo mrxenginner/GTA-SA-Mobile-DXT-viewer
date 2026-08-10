@@ -3,7 +3,7 @@
 
 #define GITHUB_OWNER "bearroleplay"
 #define GITHUB_REPO  "GTA-SA-Mobile-DXT-viewer"
-#define APP_VERSION  "1.0"
+#define APP_VERSION  "1.1"
 
 struct UpdateInfo
 {
