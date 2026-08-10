@@ -7,7 +7,8 @@
 
 Горячие клавиши: Ctrl+O, F1-F3
 
-ПОДДЕРЖИ ПРОЕКТ — ПОСТАВЬ ЗВЕЗДУ
+**ПОДДЕРЖИ ПРОЕКТ — ПОСТАВЬ ЗВЕЗДУ**
+
 ---
 
 # DXTViewer
@@ -20,4 +21,4 @@ View textures from SAMP Mobile archives.
 
 Hotkeys: Ctrl+O, F1-F3
 
-*SUPPORT THE PROJECT — GIVE IT A STAR*
+**SUPPORT THE PROJECT — GIVE IT A STAR**
