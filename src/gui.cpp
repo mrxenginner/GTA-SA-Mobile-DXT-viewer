@@ -282,10 +282,6 @@ void GuiSelectTexture(int entryIdx)
         return total;
     };
 
-    // Same as needAllMipBytes but stops at the 4×4 mip level.
-    // Rockstar mobile archives do NOT store sub-4×4 mip levels (2×2, 1×1),
-    // so the bytes stored on disk match this count, not needAllMipBytes.
-    // Binary verification: 256×256 DXT5 → 87376 B (not 87408 from needAllMipBytes).
     auto needDXTChainBytes = [&](int tw, int th) -> size_t {
         size_t total = 0;
         while (tw > 0 || th > 0)
@@ -298,18 +294,6 @@ void GuiSelectTexture(int entryIdx)
         return total;
     };
 
-    // -----------------------------------------------------------------------
-    // Decompression detection and inflate
-    //
-    // SAMP Mobile archives compress DXT data for larger textures using raw
-    // deflate (no zlib wrapper — do NOT use uncompress(), use inflateInit2
-    // with -MAX_WBITS for raw deflate).
-    // The 16-byte block header stores the dimensions; the data that follows
-    // is either the raw DXT stream (small textures) or a raw-deflate stream.
-    //
-    // Detection: if stored bytes (raw.size()-16) are less than the minimum
-    // bytes needed just for the base mip level, the data must be compressed.
-    // -----------------------------------------------------------------------
     size_t storedDataBytes = raw.size() > 16 ? raw.size() - 16 : 0;
 
     // Use block-header dims if available, fall back to txt dims for the check
@@ -341,11 +325,6 @@ void GuiSelectTexture(int entryIdx)
     std::vector<uint8_t> decompressedBuf;
     bool wasDecompressed = false;
 
-    // Escape byte: stored in the low byte of the block-header `extra` field.
-    // Must be computed BEFORE the RLE detection check because escape == 0x00
-    // means no RLE was applied (an escape byte of 0x00 would corrupt any DXT5
-    // stream, since the alpha endpoint byte 0x00 is extremely common and would
-    // be misidentified as an RLE run marker on every block).
     uint8_t escape = hdrOk ? (uint8_t)(bh.extra & 0xFF) : 0x00;
 
     // RLE detection using actualSrcBytes (true payload length, not slot size):
@@ -353,21 +332,11 @@ void GuiSelectTexture(int entryIdx)
     //   actualSrcBytes == baseMipBytes  → raw mip0 (menu_down, etc.) — skip RLE
     //   actualSrcBytes == allMipBytes   → raw all-mip stack          — skip RLE
     //   anything else                  → Rockstar block-level RLE
-    //
-    // Note: the RLE stream CAN be larger than baseMipBytes when the escape byte
-    // appears frequently in the DXT data (every such block becomes an 18-byte
-    // RUN record instead of a 16-byte literal), so we do NOT apply an upper bound.
     if (escape != 0x00 &&
         actualSrcBytes > 2 && baseMipBytes > 0 &&
         actualSrcBytes != baseMipBytes &&
         actualSrcBytes != allMipBytes)
     {
-        // Stored data is Rockstar block-level RLE.
-        //
-        // Confirmed via disassembly of libGTASA.so RLEDecompress @ 0x283030:
-        //   - uiSegSize = bytes per one DXT block: 8 (DXT1) or 16 (DXT5)
-        //   - uiEscape  = escape byte from block-header extra[0]
-        //   - SAMP forces mip=1, so we only need baseMipBytes of output.
         size_t outCapacity = baseMipBytes + baseMipBytes / 4 + 1024;
         decompressedBuf.assign(outCapacity, 0);
 
@@ -395,10 +364,6 @@ void GuiSelectTexture(int entryIdx)
         : (raw.data() + 16);
     size_t effSize = wasDecompressed ? decompressedBuf.size() : storedDataBytes;
 
-    // -----------------------------------------------------------------------
-    // Diagnostic hex dump for raw textures with escape == 0x00
-    // This helps identify what format the payload is actually in.
-    // -----------------------------------------------------------------------
     if (!wasDecompressed && escape == 0x00)
     {
         char hexBuf[256] = {};
@@ -847,7 +812,7 @@ static void ShowAbout(HWND hwnd)
         L"Viewer and editor for SAMP Mobile DXT texture archives.\n\n"
         L"Supported formats: DXT1, DXT3, DXT5\n\n"
         L"Repository:\nhttps://github.com/" GITHUB_OWNER L"/" GITHUB_REPO L"\n\n"
-        L"© 2025");
+        L"© 2026");
     MessageBoxW(hwnd, msg, L"About DXTViewer", MB_OK | MB_ICONINFORMATION);
 }
 
