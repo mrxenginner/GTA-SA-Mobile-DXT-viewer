@@ -1,4 +1,6 @@
 # GTA-SA-Mobile-DXT-viewer
+<img width="1919" height="1020" alt="image" src="https://github.com/user-attachments/assets/ac9225e2-41d6-4c0e-bd2b-cdc7c037a365" />
+
 Просмотр текстур из архивов SAMP Mobile.
 
 - Открытие индексных .txt файлов
@@ -12,6 +14,7 @@
 ---
 
 # DXTViewer
+<img width="1919" height="1020" alt="image" src="https://github.com/user-attachments/assets/7a49e691-b406-428a-a5f0-02859e476f3c" />
 
 View textures from SAMP Mobile archives.
 
