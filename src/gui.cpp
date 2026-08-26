@@ -11,14 +11,17 @@
 #include <algorithm>
 #include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
-static void RLEDecompress(uint8_t* pDest,       uint32_t uiDestSize,
-                           const uint8_t* pSrc,  uint32_t uiSrcSize,
-                           uint32_t uiSegSize,   uint8_t  uiEscape)
+static size_t RLEDecompress(uint8_t* pDest,       uint32_t uiDestSize,
+                            const uint8_t* pSrc,  uint32_t uiSrcSize,
+                            uint32_t uiSegSize,   uint8_t  uiEscape)
 {
-    if (uiDestSize == 0 || uiSegSize == 0 || uiSrcSize == 0) return;
+    if (uiDestSize == 0 || uiSegSize == 0 || uiSrcSize == 0) return 0;
     const uint8_t* pDestEnd = pDest + uiDestSize;
     const uint8_t* pSrcEnd  = pSrc  + uiSrcSize;
+    uint8_t* pDestBegin = pDest;
 
     while (pDest < pDestEnd)
     {
@@ -40,7 +43,7 @@ static void RLEDecompress(uint8_t* pDest,       uint32_t uiDestSize,
                     size_t copy  = avail < uiSegSize ? avail : uiSegSize;
                     memcpy(pDest, pBlock, copy);
                     pDest += copy;
-                    if (copy < uiSegSize) return; // dest full
+                    if (copy < uiSegSize) return uiDestSize; // dest full
                     cnt--;
                 } while (cnt != 0);
             }
@@ -54,9 +57,47 @@ static void RLEDecompress(uint8_t* pDest,       uint32_t uiDestSize,
             memcpy(pDest, pSrc, copy);
             pDest += copy;
             pSrc  += uiSegSize;
-            if (copy < uiSegSize) return; // dest full
+            if (copy < uiSegSize) return uiDestSize; // dest full
         }
     }
+    return (size_t)(pDest - pDestBegin);
+}
+
+// The archive RLE stream is made of fixed-size blocks.  A block whose first
+// byte equals escape must be emitted as a one-block run; otherwise the
+// decoder would interpret it as a run marker.
+static bool RLECompress(const uint8_t* src, size_t srcSize,
+                        uint32_t segSize, uint8_t escape,
+                        std::vector<uint8_t>& out)
+{
+    if (!src || segSize == 0 || srcSize == 0 || srcSize % segSize != 0)
+        return false;
+
+    out.clear();
+    size_t blockCount = srcSize / segSize;
+    size_t i = 0;
+    while (i < blockCount)
+    {
+        size_t run = 1;
+        while (i + run < blockCount && run < 255 &&
+               memcmp(src + i * segSize,
+                      src + (i + run) * segSize, segSize) == 0)
+            ++run;
+
+        const uint8_t* block = src + i * segSize;
+        if (run > 1 || block[0] == escape)
+        {
+            out.push_back(escape);
+            out.push_back((uint8_t)run);
+            out.insert(out.end(), block, block + segSize);
+        }
+        else
+        {
+            out.insert(out.end(), block, block + segSize);
+        }
+        i += run;
+    }
+    return true;
 }
 
 // -------------------------------------------------------------------------
@@ -522,6 +563,313 @@ void GuiSelectTexture(int entryIdx)
 // -------------------------------------------------------------------------
 // Replace texture
 // -------------------------------------------------------------------------
+static size_t DXTLevelBytes(DXTFormat fmt, int w, int h)
+{
+    int blockSize = (fmt == DXTFormat::DXT1) ? 8 : 16;
+    return (size_t)((w + 3) / 4) * ((h + 3) / 4) * blockSize;
+}
+
+static size_t DXTChainBytes(DXTFormat fmt, int w, int h, bool includeSub4)
+{
+    size_t total = 0;
+    while (w > 0 || h > 0)
+    {
+        int mw = std::max(w, 1);
+        int mh = std::max(h, 1);
+        if (!includeSub4 && mw < 4 && mh < 4)
+            break;
+        total += DXTLevelBytes(fmt, mw, mh);
+        if (mw == 1 && mh == 1)
+            break;
+        w >>= 1;
+        h >>= 1;
+    }
+    return total;
+}
+
+static uint16_t PackRGB565(uint8_t r, uint8_t g, uint8_t b)
+{
+    return (uint16_t)(((r >> 3) << 11) |
+                      ((g >> 2) << 5) |
+                      (b >> 3));
+}
+
+static void UnpackRGB565(uint16_t c, uint8_t& r, uint8_t& g, uint8_t& b)
+{
+    r = (uint8_t)((((c >> 11) & 0x1F) * 255 + 15) / 31);
+    g = (uint8_t)((((c >> 5)  & 0x3F) * 255 + 31) / 63);
+    b = (uint8_t)(((c & 0x1F) * 255 + 15) / 31);
+}
+
+static void MakeColorPalette(uint16_t c0, uint16_t c1,
+                             uint8_t pal[4][3])
+{
+    UnpackRGB565(c0, pal[0][0], pal[0][1], pal[0][2]);
+    UnpackRGB565(c1, pal[1][0], pal[1][1], pal[1][2]);
+    if (c0 > c1)
+    {
+        for (int k = 0; k < 3; ++k)
+        {
+            pal[2][k] = (uint8_t)((2 * pal[0][k] + pal[1][k] + 1) / 3);
+            pal[3][k] = (uint8_t)((pal[0][k] + 2 * pal[1][k] + 1) / 3);
+        }
+    }
+    else
+    {
+        for (int k = 0; k < 3; ++k)
+            pal[2][k] = (uint8_t)((pal[0][k] + pal[1][k]) / 2);
+        pal[3][0] = pal[3][1] = pal[3][2] = 0;
+    }
+}
+
+static int ColourDistance(const uint8_t* p, const uint8_t* c)
+{
+    int dr = (int)p[0] - c[0];
+    int dg = (int)p[1] - c[1];
+    int db = (int)p[2] - c[2];
+    return dr * dr + dg * dg + db * db;
+}
+
+static void EncodeDXTBlock(DXTFormat fmt,
+                           const uint8_t pixels[16][4],
+                           uint8_t* dst)
+{
+    if (fmt == DXTFormat::DXT3)
+    {
+        for (int i = 0; i < 16; i += 2)
+        {
+            uint8_t a0 = (uint8_t)((pixels[i][3] * 15 + 127) / 255);
+            uint8_t a1 = (uint8_t)((pixels[i + 1][3] * 15 + 127) / 255);
+            dst[i / 2] = (uint8_t)(a0 | (a1 << 4));
+        }
+    }
+    else if (fmt == DXTFormat::DXT5)
+    {
+        uint8_t aMin = 255, aMax = 0;
+        for (int i = 0; i < 16; ++i)
+        {
+            aMin = std::min(aMin, pixels[i][3]);
+            aMax = std::max(aMax, pixels[i][3]);
+        }
+
+        dst[0] = aMax;
+        dst[1] = aMin;
+
+        uint8_t table[8] = {};
+        table[0] = aMax;
+        table[1] = aMin;
+        if (aMax > aMin)
+        {
+            table[2] = (uint8_t)((6 * aMax + aMin + 3) / 7);
+            table[3] = (uint8_t)((5 * aMax + 2 * aMin + 3) / 7);
+            table[4] = (uint8_t)((4 * aMax + 3 * aMin + 3) / 7);
+            table[5] = (uint8_t)((3 * aMax + 4 * aMin + 3) / 7);
+            table[6] = (uint8_t)((2 * aMax + 5 * aMin + 3) / 7);
+            table[7] = (uint8_t)((aMax + 6 * aMin + 3) / 7);
+        }
+        else
+        {
+            table[2] = (uint8_t)((4 * aMax + aMin + 2) / 5);
+            table[3] = (uint8_t)((3 * aMax + 2 * aMin + 2) / 5);
+            table[4] = (uint8_t)((2 * aMax + 3 * aMin + 2) / 5);
+            table[5] = (uint8_t)((aMax + 4 * aMin + 2) / 5);
+            table[6] = 0;
+            table[7] = 255;
+        }
+
+        uint64_t alphaBits = 0;
+        for (int i = 0; i < 16; ++i)
+        {
+            int best = 0;
+            int bestDist = 1 << 30;
+            for (int k = 0; k < 8; ++k)
+            {
+                int d = (int)pixels[i][3] - table[k];
+                d *= d;
+                if (d < bestDist)
+                {
+                    bestDist = d;
+                    best = k;
+                }
+            }
+            alphaBits |= ((uint64_t)best) << (i * 3);
+        }
+        for (int i = 0; i < 6; ++i)
+            dst[2 + i] = (uint8_t)(alphaBits >> (i * 8));
+    }
+
+    uint8_t rMin = 255, rMax = 0;
+    uint8_t gMin = 255, gMax = 0;
+    uint8_t bMin = 255, bMax = 0;
+    bool hasTransparent = false;
+    for (int i = 0; i < 16; ++i)
+    {
+        rMin = std::min(rMin, pixels[i][0]);
+        rMax = std::max(rMax, pixels[i][0]);
+        gMin = std::min(gMin, pixels[i][1]);
+        gMax = std::max(gMax, pixels[i][1]);
+        bMin = std::min(bMin, pixels[i][2]);
+        bMax = std::max(bMax, pixels[i][2]);
+        if (pixels[i][3] < 128)
+            hasTransparent = true;
+    }
+
+    uint16_t c0 = PackRGB565(rMax, gMax, bMax);
+    uint16_t c1 = PackRGB565(rMin, gMin, bMin);
+    if (fmt == DXTFormat::DXT1 && hasTransparent)
+    {
+        if (c0 > c1)
+            std::swap(c0, c1);
+    }
+    else
+    {
+        if (c0 < c1)
+            std::swap(c0, c1);
+        if (c0 == c1)
+        {
+            if (c0 < 0xFFFF)
+                ++c0;
+            else if (c1 > 0)
+                --c1;
+        }
+    }
+
+    size_t colourOffset = (fmt == DXTFormat::DXT1) ? 0 : 8;
+    dst[colourOffset + 0] = (uint8_t)(c0 & 0xFF);
+    dst[colourOffset + 1] = (uint8_t)(c0 >> 8);
+    dst[colourOffset + 2] = (uint8_t)(c1 & 0xFF);
+    dst[colourOffset + 3] = (uint8_t)(c1 >> 8);
+
+    uint8_t pal[4][3] = {};
+    MakeColorPalette(c0, c1, pal);
+    uint32_t indices = 0;
+    int paletteCount = (c0 <= c1) ? 3 : 4;
+    for (int i = 0; i < 16; ++i)
+    {
+        int best = 0;
+        int bestDist = 1 << 30;
+        if (fmt == DXTFormat::DXT1 && hasTransparent &&
+            pixels[i][3] < 128)
+        {
+            best = 3;
+        }
+        else
+        {
+            for (int k = 0; k < paletteCount; ++k)
+            {
+                int d = ColourDistance(pixels[i], pal[k]);
+                if (d < bestDist)
+                {
+                    bestDist = d;
+                    best = k;
+                }
+            }
+        }
+        indices |= ((uint32_t)best) << (i * 2);
+    }
+
+    dst[colourOffset + 4] = (uint8_t)(indices & 0xFF);
+    dst[colourOffset + 5] = (uint8_t)((indices >> 8) & 0xFF);
+    dst[colourOffset + 6] = (uint8_t)((indices >> 16) & 0xFF);
+    dst[colourOffset + 7] = (uint8_t)((indices >> 24) & 0xFF);
+}
+
+static std::vector<uint8_t> EncodeDXTLevel(DXTFormat fmt,
+                                           const std::vector<uint8_t>& rgba,
+                                           int w, int h)
+{
+    int blockSize = (fmt == DXTFormat::DXT1) ? 8 : 16;
+    int bw = (w + 3) / 4;
+    int bh = (h + 3) / 4;
+    std::vector<uint8_t> out((size_t)bw * bh * blockSize, 0);
+
+    for (int by = 0; by < bh; ++by)
+    {
+        for (int bx = 0; bx < bw; ++bx)
+        {
+            uint8_t pixels[16][4] = {};
+            for (int dy = 0; dy < 4; ++dy)
+            {
+                for (int dx = 0; dx < 4; ++dx)
+                {
+                    int px = std::min(bx * 4 + dx, w - 1);
+                    int py = std::min(by * 4 + dy, h - 1);
+                    size_t si = ((size_t)py * w + px) * 4;
+                    int pi = dy * 4 + dx;
+                    pixels[pi][0] = rgba[si + 0];
+                    pixels[pi][1] = rgba[si + 1];
+                    pixels[pi][2] = rgba[si + 2];
+                    pixels[pi][3] = rgba[si + 3];
+                }
+            }
+            EncodeDXTBlock(fmt, pixels,
+                out.data() + ((size_t)by * bw + bx) * blockSize);
+        }
+    }
+    return out;
+}
+
+static std::vector<uint8_t> DownsampleRGBA(const std::vector<uint8_t>& src,
+                                           int sw, int sh,
+                                           int& dw, int& dh)
+{
+    dw = std::max(1, sw / 2);
+    dh = std::max(1, sh / 2);
+    std::vector<uint8_t> out((size_t)dw * dh * 4, 0);
+    for (int y = 0; y < dh; ++y)
+    {
+        for (int x = 0; x < dw; ++x)
+        {
+            int sum[4] = {};
+            int count = 0;
+            for (int oy = 0; oy < 2; ++oy)
+            {
+                for (int ox = 0; ox < 2; ++ox)
+                {
+                    int sx = std::min(sw - 1, x * 2 + ox);
+                    int sy = std::min(sh - 1, y * 2 + oy);
+                    size_t si = ((size_t)sy * sw + sx) * 4;
+                    for (int k = 0; k < 4; ++k)
+                        sum[k] += src[si + k];
+                    ++count;
+                }
+            }
+            size_t di = ((size_t)y * dw + x) * 4;
+            for (int k = 0; k < 4; ++k)
+                out[di + k] = (uint8_t)((sum[k] + count / 2) / count);
+        }
+    }
+    return out;
+}
+
+static std::vector<uint8_t> EncodeDXTChain(DXTFormat fmt,
+                                           const std::vector<uint8_t>& base,
+                                           int w, int h,
+                                           bool includeSub4)
+{
+    std::vector<uint8_t> out;
+    std::vector<uint8_t> level = base;
+    int lw = w, lh = h;
+    while (lw > 0 || lh > 0)
+    {
+        int mw = std::max(lw, 1);
+        int mh = std::max(lh, 1);
+        if (!includeSub4 && mw < 4 && mh < 4)
+            break;
+
+        std::vector<uint8_t> encoded = EncodeDXTLevel(fmt, level, mw, mh);
+        out.insert(out.end(), encoded.begin(), encoded.end());
+
+        if (mw == 1 && mh == 1)
+            break;
+        int nw = 0, nh = 0;
+        level = DownsampleRGBA(level, mw, mh, nw, nh);
+        lw = nw;
+        lh = nh;
+    }
+    return out;
+}
+
 void GuiReplaceTexture(HWND hwnd)
 {
     if (g.selectedIdx < 0 || g.selectedIdx >= (int)g.arc.entries.size())
@@ -557,16 +905,18 @@ void GuiReplaceTexture(HWND hwnd)
     int nw = (int)bmp.GetWidth();
     int nh = (int)bmp.GetHeight();
 
-    // Warn if resolution differs
+    // In-place replacement cannot change the dimensions recorded in the
+    // archive. Continuing would make the block layout disagree with the
+    // .txt/.toc metadata.
     if ((e.width && nw != e.width) || (e.height && nh != e.height))
     {
         wchar_t msg[256];
         swprintf(msg, 256,
             L"Image resolution %d×%d does not match original %d×%d.\n"
-            L"This may cause display errors in-game.\n\nContinue anyway?",
+            L"In-place replacement requires the original resolution.",
             nw, nh, e.width, e.height);
-        if (MessageBoxW(hwnd, msg, L"Resolution Mismatch", MB_YESNO | MB_ICONWARNING) != IDYES)
-            return;
+        MessageBoxW(hwnd, msg, L"Resolution Mismatch", MB_ICONWARNING);
+        return;
     }
 
     // Read original raw block to preserve the 16-byte header
@@ -577,123 +927,178 @@ void GuiReplaceTexture(HWND hwnd)
         return;
     }
 
-    // Encode the loaded image to the same DXT format
-    // We do a simple 1:1 copy by decoding the PNG and re-encoding to DXT
-    // (full DXT encoder implementation is out of scope; we store RGBA raw
-    //  and replace only if original was uncompressed, otherwise warn)
-    // For now: if the source image matches dimensions and the original data
-    // size equals what we expect for that DXT format, encode it.
-    // Simplified: write RGBA directly into a temporary raw block matching size.
-    // A full DXT encoder would go here — for correctness, we encode
-    // the bitmap to a BMP in memory and replace the dat block with the
-    // re-encoded DXT data using a soft DXT encoder.
-
     // Lock bits for RGBA access
     Gdiplus::Rect rect(0, 0, nw, nh);
     Gdiplus::BitmapData bdata;
-    bmp.LockBits(&rect, Gdiplus::ImageLockModeRead,
-                 PixelFormat32bppARGB, &bdata);
-
-    // Build DXT1 or DXT5 data (minimal software encoder)
-    DXTFormat fmt = DXTGuessFormat(e.alphaMode, g.arc.header.defaultFormat);
-    int blockSize  = (fmt == DXTFormat::DXT1) ? 8 : 16;
-    int bw = (nw + 3) / 4, bh = (nh + 3) / 4;
-    size_t dxtDataSize = (size_t)(bw * bh * blockSize);
-    size_t newTotalSize = 16 + dxtDataSize;
-
-    if (newTotalSize != origRaw.size())
+    if (bmp.LockBits(&rect, Gdiplus::ImageLockModeRead,
+                     PixelFormat32bppARGB, &bdata) != Gdiplus::Ok)
     {
-        bmp.UnlockBits(&bdata);
+        MessageBoxW(hwnd, L"Cannot read image pixels.", L"Replace", MB_ICONERROR);
+        return;
+    }
+
+    std::vector<uint8_t> rgba((size_t)nw * nh * 4, 0);
+    for (int y = 0; y < nh; ++y)
+    {
+        const uint8_t* row =
+            (const uint8_t*)bdata.Scan0 + y * bdata.Stride;
+        for (int x = 0; x < nw; ++x)
+        {
+            const uint8_t* p = row + x * 4; // GDI+ BGRA
+            size_t di = ((size_t)y * nw + x) * 4;
+            rgba[di + 0] = p[2];
+            rgba[di + 1] = p[1];
+            rgba[di + 2] = p[0];
+            rgba[di + 3] = p[3];
+        }
+    }
+    bmp.UnlockBits(&bdata);
+
+    TexBlockHeader originalHeader{};
+    if (!ArchiveParseBlockHeader(origRaw, originalHeader))
+    {
+        MessageBoxW(hwnd, L"Original texture block has an invalid header.",
+                    L"Replace", MB_ICONERROR);
+        return;
+    }
+
+    size_t slotPayloadSize = origRaw.size() - 16;
+    size_t originalPayloadSize =
+        (originalHeader.dataSize > 0 &&
+         (size_t)originalHeader.dataSize <= slotPayloadSize)
+        ? (size_t)originalHeader.dataSize
+        : slotPayloadSize;
+
+    std::vector<uint8_t> replacementPayload;
+    bool wasRle = false;
+
+    // Uncompressed RGBA8888 textures keep their original format.
+    if (originalPayloadSize == (size_t)nw * nh * 4)
+    {
+        replacementPayload = rgba;
+    }
+    else
+    {
+        DXTFormat fmt = DXTGuessFormat(e.alphaMode, g.arc.header.defaultFormat);
+        size_t baseBytes = DXTLevelBytes(fmt, nw, nh);
+        size_t chainBytes = DXTChainBytes(fmt, nw, nh, false);
+        size_t allMipBytes = DXTChainBytes(fmt, nw, nh, true);
+        size_t doubleMin = chainBytes * 2 + 6;
+        size_t doubleMax = chainBytes * 2 + 16;
+        size_t subHeaderSize = 0;
+
+        enum class Layout { Base, Chain, All, Double, Unknown };
+        Layout layout = Layout::Unknown;
+        std::vector<uint8_t> decodedPayload;
+        const uint8_t* sourcePayload = origRaw.data() + 16;
+        size_t sourcePayloadSize = originalPayloadSize;
+        uint8_t escape = (uint8_t)(originalHeader.extra & 0xFF);
+        wasRle = escape != 0;
+
+        auto DetectLayout = [&](size_t n) -> Layout {
+            if (n == baseBytes) return Layout::Base;
+            if (n == chainBytes) return Layout::Chain;
+            if (n == allMipBytes) return Layout::All;
+            if (n >= doubleMin && n <= doubleMax)
+            {
+                subHeaderSize = n - chainBytes * 2;
+                return Layout::Double;
+            }
+            return Layout::Unknown;
+        };
+
+        if (wasRle)
+        {
+            size_t maxDecoded = std::max(allMipBytes, chainBytes * 2 + 16);
+            decodedPayload.assign(maxDecoded, 0);
+            size_t decodedSize = RLEDecompress(
+                decodedPayload.data(), (uint32_t)decodedPayload.size(),
+                sourcePayload, (uint32_t)sourcePayloadSize,
+                (uint32_t)((fmt == DXTFormat::DXT1) ? 8 : 16), escape);
+            layout = DetectLayout(decodedSize);
+            if (layout == Layout::Unknown)
+            {
+                MessageBoxW(hwnd, L"Unsupported compressed texture layout.",
+                            L"Replace", MB_ICONERROR);
+                return;
+            }
+            decodedPayload.resize(decodedSize);
+            sourcePayload = decodedPayload.data();
+            sourcePayloadSize = decodedPayload.size();
+        }
+        else
+        {
+            layout = DetectLayout(sourcePayloadSize);
+            if (layout == Layout::Unknown)
+            {
+                MessageBoxW(hwnd,
+                    L"Unsupported texture layout. The archive does not contain "
+                    L"a recognised DXT mip chain.",
+                    L"Replace", MB_ICONERROR);
+                return;
+            }
+        }
+
+        bool includeSub4 = (layout == Layout::All);
+        std::vector<uint8_t> encoded =
+            EncodeDXTChain(fmt, rgba, nw, nh, includeSub4);
+
+        if (layout == Layout::Double)
+        {
+            replacementPayload.assign(sourcePayload,
+                                      sourcePayload + sourcePayloadSize);
+            if (subHeaderSize + chainBytes * 2 > replacementPayload.size() ||
+                encoded.size() != chainBytes)
+            {
+                MessageBoxW(hwnd, L"Double-chain texture layout is invalid.",
+                            L"Replace", MB_ICONERROR);
+                return;
+            }
+            std::copy(encoded.begin(), encoded.end(),
+                      replacementPayload.begin() + subHeaderSize);
+        }
+        else
+        {
+            replacementPayload = std::move(encoded);
+        }
+
+        if (wasRle)
+        {
+            std::vector<uint8_t> compressed;
+            uint32_t segSize = (fmt == DXTFormat::DXT1) ? 8 : 16;
+            if (!RLECompress(replacementPayload.data(),
+                            replacementPayload.size(), segSize,
+                            escape, compressed))
+            {
+                MessageBoxW(hwnd, L"Cannot encode compressed texture.",
+                            L"Replace", MB_ICONERROR);
+                return;
+            }
+            replacementPayload = std::move(compressed);
+        }
+    }
+
+    if (replacementPayload.size() > slotPayloadSize)
+    {
         wchar_t msg[256];
         swprintf(msg, 256,
-            L"Encoded size (%zu bytes) differs from original (%zu bytes).\n"
-            L"In-place replacement is not possible.",
-            newTotalSize, origRaw.size());
+            L"Replacement needs %zu bytes, but the archive slot has %zu bytes.",
+            replacementPayload.size(), slotPayloadSize);
         MessageBoxW(hwnd, msg, L"Replace", MB_ICONERROR);
         return;
     }
 
-    // Simple DXT1/DXT5 encoder: for each 4×4 block find min/max colours
-    std::vector<uint8_t> newRaw = origRaw; // copy header
-    uint8_t* dstBlock = newRaw.data() + 16;
+    // Keep the slot size and padding, replace only the actual payload.
+    std::vector<uint8_t> newRaw = origRaw;
+    std::fill(newRaw.begin() + 16, newRaw.end(), 0);
+    std::copy(replacementPayload.begin(), replacementPayload.end(),
+              newRaw.begin() + 16);
 
-    const uint8_t* src = (const uint8_t*)bdata.Scan0;
-    int stride = bdata.Stride;
-
-    for (int by = 0; by < bh; ++by)
-    {
-        for (int bx = 0; bx < bw; ++bx)
-        {
-            // Collect 4×4 pixels (BGRA from GDI+)
-            uint8_t pixels[4][4][4] = {};
-            for (int dy = 0; dy < 4; ++dy)
-                for (int dx = 0; dx < 4; ++dx)
-                {
-                    int px = bx*4+dx, py = by*4+dy;
-                    if (px < nw && py < nh)
-                    {
-                        const uint8_t* p = src + py*stride + px*4;
-                        pixels[dy][dx][0] = p[2]; // R
-                        pixels[dy][dx][1] = p[1]; // G
-                        pixels[dy][dx][2] = p[0]; // B
-                        pixels[dy][dx][3] = p[3]; // A
-                    }
-                }
-
-            if (fmt == DXTFormat::DXT5)
-            {
-                // Alpha block: min/max alpha
-                uint8_t aMin=255, aMax=0;
-                for (int i=0;i<4;++i) for(int j=0;j<4;++j)
-                { aMin=std::min(aMin,pixels[i][j][3]); aMax=std::max(aMax,pixels[i][j][3]); }
-                dstBlock[0] = aMax; dstBlock[1] = aMin;
-                // Simple: all pixels use interpolated; encode as 3-bit indices
-                uint64_t aBits = 0;
-                for (int i = 0; i < 16; ++i)
-                {
-                    int ai = i/4, aj = i%4;
-                    uint8_t a = pixels[ai][aj][3];
-                    int idx = (aMax != aMin) ? (int)((aMax - a) * 6 / (aMax - aMin)) : 0;
-                    aBits |= ((uint64_t)(idx & 7)) << (i*3);
-                }
-                for (int i = 0; i < 6; ++i) dstBlock[2+i] = (uint8_t)(aBits >> (i*8));
-                dstBlock += 8; // advance, colour block follows
-            }
-
-            // Colour block (DXT1 part, shared by DXT1/DXT5)
-            uint8_t rMin=255,rMax=0,gMin=255,gMax=0,bMin=255,bMax=0;
-            for(int i=0;i<4;++i) for(int j=0;j<4;++j)
-            {
-                rMin=std::min(rMin,pixels[i][j][0]); rMax=std::max(rMax,pixels[i][j][0]);
-                gMin=std::min(gMin,pixels[i][j][1]); gMax=std::max(gMax,pixels[i][j][1]);
-                bMin=std::min(bMin,pixels[i][j][2]); bMax=std::max(bMax,pixels[i][j][2]);
-            }
-            uint16_t c0 = (uint16_t)(((rMax>>3)<<11)|((gMax>>2)<<5)|(bMax>>3));
-            uint16_t c1 = (uint16_t)(((rMin>>3)<<11)|((gMin>>2)<<5)|(bMin>>3));
-            if (fmt == DXTFormat::DXT1 && c0 <= c1) std::swap(c0, c1);
-
-            dstBlock[0] = c0 & 0xFF; dstBlock[1] = (c0>>8) & 0xFF;
-            dstBlock[2] = c1 & 0xFF; dstBlock[3] = (c1>>8) & 0xFF;
-
-            uint32_t indices = 0;
-            for (int i = 0; i < 16; ++i)
-            {
-                int ai=i/4, aj=i%4;
-                uint8_t r2=pixels[ai][aj][0], g2=pixels[ai][aj][1], b2=pixels[ai][aj][2];
-                // Pick closest of c0/c1
-                int d0 = abs(r2-rMax)+abs(g2-gMax)+abs(b2-bMax);
-                int d1 = abs(r2-rMin)+abs(g2-gMin)+abs(b2-bMin);
-                indices |= ((d0<=d1 ? 0 : 1) << (i*2));
-            }
-            dstBlock[4]=(uint8_t)(indices&0xFF);
-            dstBlock[5]=(uint8_t)((indices>>8)&0xFF);
-            dstBlock[6]=(uint8_t)((indices>>16)&0xFF);
-            dstBlock[7]=(uint8_t)((indices>>24)&0xFF);
-            dstBlock += 8;
-        }
-    }
-
-    bmp.UnlockBits(&bdata);
+    uint32_t newDataSize = (uint32_t)replacementPayload.size();
+    newRaw[8]  = (uint8_t)(newDataSize & 0xFF);
+    newRaw[9]  = (uint8_t)((newDataSize >> 8) & 0xFF);
+    newRaw[10] = (uint8_t)((newDataSize >> 16) & 0xFF);
+    newRaw[11] = (uint8_t)((newDataSize >> 24) & 0xFF);
 
     std::string err;
     if (!ArchiveReplaceTexData(g.arc, e, newRaw, err))

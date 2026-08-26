@@ -1,9 +1,11 @@
 #include "archive.h"
 #include "logger.h"
+#include <windows.h>
 #include <fstream>
 #include <sstream>
 #include <algorithm>
 #include <cstring>
+#include <cwctype>
 
 static std::string ExtractQuotedName(const std::string& line, size_t& pos)
 {
@@ -393,6 +395,21 @@ bool ArchiveReplaceTexData(const Archive& arc,
         return false;
     }
 
+    // Never make the first edit without a restorable copy of the archive.
+    // Existing backups are deliberately preserved so a second replacement
+    // cannot overwrite the user's original backup.
+    std::wstring backupPath = arc.datPath + L".bak";
+    DWORD backupAttr = GetFileAttributesW(backupPath.c_str());
+    if (backupAttr == INVALID_FILE_ATTRIBUTES)
+    {
+        if (!CopyFileW(arc.datPath.c_str(), backupPath.c_str(), TRUE))
+        {
+            errorMsg = "Cannot create dat backup before writing";
+            return false;
+        }
+        LOG_INFO("Created archive backup: %ls", backupPath.c_str());
+    }
+
     std::fstream f(arc.datPath.c_str(), std::ios::binary | std::ios::in | std::ios::out);
     if (!f.is_open())
     {
@@ -405,6 +422,12 @@ bool ArchiveReplaceTexData(const Archive& arc,
     if (!f)
     {
         errorMsg = "Write failed";
+        return false;
+    }
+    f.flush();
+    if (!f)
+    {
+        errorMsg = "Flush failed";
         return false;
     }
 
